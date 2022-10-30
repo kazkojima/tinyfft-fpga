@@ -34,6 +34,9 @@ class FixedPointFFT(Elaboratable):
         self.Wr = [int(cos(k*2*pi/pts)*(2**(bitwidth-1))) for k in range(pts)]
         self.Wi = [int(-sin(k*2*pi/pts)*(2**(bitwidth-1))) for k in range(pts)]
 
+        # 4-term Blackman-Harris window function
+        self.wF = [int((0.35875-0.48829*cos(k*2*pi/pts)+0.14128*cos(k*4*pi/pts)-0.01168*cos(k*6*pi/pts))*(2**(bitwidth-1))) for k in range(pts)]
+
         assert pts == 2**self.stages, f"Points {pts} must be 2**stages {self.stages}"
 
     def elaborate(self, platform) -> Module:
@@ -47,9 +50,11 @@ class FixedPointFFT(Elaboratable):
         yr = Memory(width=bw, depth=self.pts, name="yr")
         yi = Memory(width=bw, depth=self.pts, name="yi")
 
+        wF = Array(Const(v, signed(width+1)) for v in self.wF)
+
         Wr = Array(Const(v, signed(width+1)) for v in self.Wr)
         Wi = Array(Const(v, signed(width+1)) for v in self.Wi)
-
+        
         m.submodules.xr_rd = xr_rd = xr.read_port()
         m.submodules.xr_wr = xr_wr = xr.write_port()
         m.submodules.xi_rd = xi_rd = xi.read_port()
@@ -64,8 +69,18 @@ class FixedPointFFT(Elaboratable):
         revidx = Signal(N)
         m.d.comb += revidx.eq(Cat([idx.bit_select(i,1) for i in reversed(range(N))]))
 
-        widx = Signal(N)
+        # Window
+        wf = Signal(signed(width+1))
+        i_cooked = Signal(signed(width))
+        q_cooked = Signal(signed(width))
+        m.d.comb += [
+            wf.eq(wF[idx]),
+            i_cooked.eq((wf*self.in_i) >> (width-1)),
+            q_cooked.eq((wf*self.in_q) >> (width-1)),
+        ]
 
+        # FFT
+        widx = Signal(N)
         stage = Signal(range(N+1))
         mask = Signal(signed(N))
 
@@ -73,12 +88,6 @@ class FixedPointFFT(Elaboratable):
         ai = Signal(signed(bw))
         br = Signal(signed(bw))
         bi = Signal(signed(bw))
-        bwr = Signal(signed(bw))
-        bwi = Signal(signed(bw))
-        si = Signal(signed(bw))
-        sr = Signal(signed(bw))
-        di = Signal(signed(bw))
-        dr = Signal(signed(bw))
 
         # coefficients
         wr = Signal(signed(width+1))
@@ -88,17 +97,33 @@ class FixedPointFFT(Elaboratable):
         m.d.comb += wr.eq(Wr[widx])
         m.d.comb += wi.eq(Wi[widx])
 
-        # products
+        # complex multiplication
         mrr = Signal(signed(bw))
         mii = Signal(signed(bw))
         mri = Signal(signed(bw))
         mir = Signal(signed(bw))
+        bwr = Signal(signed(bw))
+        bwi = Signal(signed(bw))
 
         m.d.comb += [
             mrr.eq((br * wr) >> (width-1)),
             mii.eq((bi * wi) >> (width-1)),
             mri.eq((br * wi) >> (width-1)),
             mir.eq((bi * wr) >> (width-1)),
+            bwr.eq(mrr - mii),
+            bwi.eq(mri + mir),
+        ]
+
+        # butterfly
+        si = Signal(signed(bw))
+        sr = Signal(signed(bw))
+        di = Signal(signed(bw))
+        dr = Signal(signed(bw))
+        m.d.comb += [
+            sr.eq(ar + bwr),
+            si.eq(ai + bwi),
+            dr.eq(ar - bwr),
+            di.eq(ai - bwi),
         ]
 
         # Control FSM
@@ -108,34 +133,31 @@ class FixedPointFFT(Elaboratable):
                 m.next = "WINDOW"
 
             with m.State("WINDOW"):
+                m.d.sync += xr_wr.en.eq(0)
+                m.d.sync += xi_wr.en.eq(0)
                 with m.If(idx >= pts):
                     m.d.sync += stage.eq(0)
                     m.d.sync += idx.eq(0)
                     m.d.sync += mask.eq(~((2 << (N-2))-1))
-                    m.next = "READ"
+                    m.next = "FFTLOOP"
                 with m.Else():
                     m.next = "WINDOW_MUL"
 
             with m.State("WINDOW_MUL"):
                 with m.If(self.strobe_in):
-                    m.next = "WINDOW_WRITE0"
-                    m.d.sync += xr_wr.data.eq(self.in_i)
-                    m.d.sync += xi_wr.data.eq(self.in_q)
+                    m.d.sync += xr_wr.data.eq(i_cooked)
+                    m.d.sync += xi_wr.data.eq(q_cooked)
                     m.d.sync += xr_wr.addr.eq(revidx)
                     m.d.sync += xi_wr.addr.eq(revidx)
+                    m.next = "WINDOW_WRITE"
 
-            with m.State("WINDOW_WRITE0"):
+            with m.State("WINDOW_WRITE"):
                 m.d.sync += xr_wr.en.eq(1)
                 m.d.sync += xi_wr.en.eq(1)
-                m.next = "WINDOW_WRITE1"
-
-            with m.State("WINDOW_WRITE1"):
-                m.d.sync += xr_wr.en.eq(0)
-                m.d.sync += xi_wr.en.eq(0)
                 m.d.sync += idx.eq(idx+1)
                 m.next = "WINDOW"
 
-            with m.State("READ"):
+            with m.State("FFTLOOP"):
                 m.d.sync += xr_wr.en.eq(0)
                 m.d.sync += xi_wr.en.eq(0)
                 m.d.sync += yr_wr.en.eq(0)
@@ -172,11 +194,9 @@ class FixedPointFFT(Elaboratable):
                     m.d.sync += br.eq(xr_rd.data)
                     m.d.sync += bi.eq(xi_rd.data)
 
-                m.next = "ROTATE"
+                m.next = "ADDRA"
            
-            with m.State("ROTATE"):
-                m.d.sync += bwr.eq(mrr - mii)
-                m.d.sync += bwi.eq(mri + mir)
+            with m.State("ADDRA"):
                 with m.If(stage & 1):
                     m.d.sync += yr_rd.addr.eq(2*idx)
                     m.d.sync += yi_rd.addr.eq(2*idx)
@@ -200,13 +220,6 @@ class FixedPointFFT(Elaboratable):
                 m.next = "BUTTERFLY"
            
             with m.State("BUTTERFLY"):
-                m.d.sync += sr.eq(ar + bwr)
-                m.d.sync += si.eq(ai + bwi)
-                m.d.sync += dr.eq(ar - bwr)
-                m.d.sync += di.eq(ai - bwi)
-                m.next = "WRITE_BUTTERFLY"
-
-            with m.State("WRITE_BUTTERFLY"):
                 with m.If(stage & 1):
                     m.d.sync += xr_wr.data.eq(sr)
                     m.d.sync += xi_wr.data.eq(si)
@@ -228,25 +241,19 @@ class FixedPointFFT(Elaboratable):
                     m.d.sync += yr_wr.en.eq(1)
                     m.d.sync += yi_wr.en.eq(1)
 
-                m.next = "WRITESUM_DONE"
-
-            with m.State("WRITESUM_DONE"):
-                with m.If(stage & 1):
-                    m.d.sync += xr_wr.en.eq(0)
-                    m.d.sync += xi_wr.en.eq(0)
-                with m.Else():
-                    m.d.sync += yr_wr.en.eq(0)
-                    m.d.sync += yi_wr.en.eq(0)
-
                 m.next = "ADDRDIFF"
            
             with m.State("ADDRDIFF"):
                 with m.If(stage & 1):
+                    m.d.sync += xr_wr.en.eq(0)
+                    m.d.sync += xi_wr.en.eq(0)
                     m.d.sync += xr_wr.data.eq(dr)
                     m.d.sync += xi_wr.data.eq(di)
                     m.d.sync += xr_wr.addr.eq(idx+(pts>>1))
                     m.d.sync += xi_wr.addr.eq(idx+(pts>>1))
                 with m.Else():
+                    m.d.sync += yr_wr.en.eq(0)
+                    m.d.sync += yi_wr.en.eq(0)
                     m.d.sync += yr_wr.data.eq(dr)
                     m.d.sync += yi_wr.data.eq(di)
                     m.d.sync += yr_wr.addr.eq(idx+(pts>>1))
@@ -262,20 +269,11 @@ class FixedPointFFT(Elaboratable):
                     m.d.sync += yr_wr.en.eq(1)
                     m.d.sync += yi_wr.en.eq(1)
 
-                m.next = "WRITEDIFF_DONE"
-
-            with m.State("WRITEDIFF_DONE"):
-                with m.If(stage & 1):
-                    m.d.sync += xr_wr.en.eq(0)
-                    m.d.sync += xi_wr.en.eq(0)
-                with m.Else():
-                    m.d.sync += yr_wr.en.eq(0)
-                    m.d.sync += yi_wr.en.eq(0)
-
                 m.d.sync += idx.eq(idx+1)
-                m.next = "READ"
+                m.next = "FFTLOOP"
 
             with m.State("OUTPUT"):
+                m.d.sync += self.strobe_out.eq(0)
                 with m.If(idx >= pts):
                     m.next = "DONE"
                 with m.Else():
@@ -297,10 +295,6 @@ class FixedPointFFT(Elaboratable):
                     m.d.sync += self.out_imag.eq(xi_rd.data>>N)
 
                 m.d.sync += self.strobe_out.eq(1)
-                m.next = "OUTPUTIDX"
-
-            with m.State("OUTPUTIDX"):
-                m.d.sync += self.strobe_out.eq(0)
                 m.d.sync += idx.eq(idx+1)
                 m.next = "OUTPUT"
 
@@ -317,6 +311,8 @@ class FixedPointFFTTest(GatewareTestCase):
     def test_fft(self):
         dut = self.dut
         PTS = 256
+        LPTS = log2_int(PTS)
+
         I =[int(cos(2*16*pi*i/PTS) * (2**16-1)) for i in range(PTS)]
         Q =[int(sin(2*16*pi*i/PTS) * (2**16-1)) for i in range(PTS)]
 
@@ -331,7 +327,8 @@ class FixedPointFFTTest(GatewareTestCase):
             yield
             yield
 
-        for _ in range(PTS*150):
+        # Looks that it takes ~12 cycles for read-butterfly-write
+        for _ in range(PTS*LPTS*12):
             yield
 
 
