@@ -16,7 +16,7 @@ from pprint import pformat
 
 class FixedPointFFT(Elaboratable):
     def __init__(self,
-                 bitwidth: int=18,
+                 bitwidth: int=16,
                  pts:      int=1024,
                  verbose:  bool=True) -> None:
 
@@ -50,10 +50,10 @@ class FixedPointFFT(Elaboratable):
         yr = Memory(width=bw, depth=self.pts, name="yr")
         yi = Memory(width=bw, depth=self.pts, name="yi")
 
-        wF = Array(Const(v, signed(width+1)) for v in self.wF)
+        wF = Memory(width=width+1, depth=self.pts, init=self.wF, name="wF")
 
-        Wr = Array(Const(v, signed(width+1)) for v in self.Wr)
-        Wi = Array(Const(v, signed(width+1)) for v in self.Wi)
+        Wr = Memory(width=width+1, depth=self.pts, init=self.Wr, name="Wr")
+        Wi = Memory(width=width+1, depth=self.pts, init=self.Wi, name="Wi")
         
         m.submodules.xr_rd = xr_rd = xr.read_port()
         m.submodules.xr_wr = xr_wr = xr.write_port()
@@ -63,6 +63,10 @@ class FixedPointFFT(Elaboratable):
         m.submodules.yr_wr = yr_wr = yr.write_port()
         m.submodules.yi_rd = yi_rd = yi.read_port()
         m.submodules.yi_wr = yi_wr = yi.write_port()
+
+        m.submodules.wF_rd = wF_rd = wF.read_port()
+        m.submodules.Wr_rd = Wr_rd = Wr.read_port()
+        m.submodules.Wi_rd = Wi_rd = Wi.read_port()
 
         N = self.stages
         idx = Signal(N+1)
@@ -74,7 +78,8 @@ class FixedPointFFT(Elaboratable):
         i_cooked = Signal(signed(width))
         q_cooked = Signal(signed(width))
         m.d.comb += [
-            wf.eq(wF[idx]),
+            wF_rd.addr.eq(idx),
+            wf.eq(wF_rd.data),
             i_cooked.eq((wf*self.in_i) >> (width-1)),
             q_cooked.eq((wf*self.in_q) >> (width-1)),
         ]
@@ -93,9 +98,13 @@ class FixedPointFFT(Elaboratable):
         wr = Signal(signed(width+1))
         wi = Signal(signed(width+1))
 
-        m.d.comb += widx.eq(idx & mask)
-        m.d.comb += wr.eq(Wr[widx])
-        m.d.comb += wi.eq(Wi[widx])
+        m.d.comb += [
+            widx.eq(idx & mask),
+            Wr_rd.addr.eq(widx),
+            Wi_rd.addr.eq(widx),
+            wr.eq(Wr_rd.data),
+            wi.eq(Wi_rd.data),
+        ]
 
         # complex multiplication
         mrr = Signal(signed(bw))
@@ -185,7 +194,7 @@ class FixedPointFFT(Elaboratable):
            
             with m.State("ADDRB_LATCHED"):
                 m.next = "READB"
-           
+
             with m.State("READB"):
                 with m.If(stage & 1):
                     m.d.sync += br.eq(yr_rd.data)
@@ -327,21 +336,21 @@ class FixedPointFFTTest(GatewareTestCase):
             yield
             yield
 
-        # Looks that it takes ~12 cycles for read-butterfly-write
-        for _ in range(PTS*LPTS*12):
+        # Looks that it takes ~13 cycles for read-butterfly-write
+        for _ in range(PTS*LPTS*13):
             yield
 
 
 if __name__ == "__main__":
 
-    vfft = FixedPointFFT()
+    fft = FixedPointFFT()
 
     ports = [
-        vfft.in_i,
-        vfft.in_q,
-        vfft.out_real,
-        vfft.out_imag,
-        vfft.strobe_in,
-        vfft.strobe_out,
+        fft.in_i,
+        fft.in_q,
+        fft.out_real,
+        fft.out_imag,
+        fft.strobe_in,
+        fft.strobe_out,
     ]
-    main(vfft, name="FixedPointFFT", ports=ports)
+    main(fft, name="FixedPointFFT", ports=ports)
