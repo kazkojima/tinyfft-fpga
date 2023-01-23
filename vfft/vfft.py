@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (c) 2022 Kaz Kojima <kkojima@rr.iij4u.or.jp>
+# Copyright (c) 2022-2023 Kaz Kojima <kkojima@rr.iij4u.or.jp>
 # SPDX-License-Identifier: CERN-OHL-W-2.0
 
 from amaranth import *
@@ -34,11 +34,17 @@ class FixedPointFFT(Elaboratable):
         self.strobe_in = Signal()
         self.strobe_out = Signal()
 
+        self.wf_start = Signal()
+        self.wf_strobe = Signal()
+        self.wf_real = Signal(signed(bitwidth+1))
+        self.wf_imag = Signal(signed(bitwidth+1))
+
         self.Wr = [int(cos(k*2*pi/pts)*(2**(bitwidth-1))) for k in range(pts)]
         self.Wi = [int(-sin(k*2*pi/pts)*(2**(bitwidth-1))) for k in range(pts)]
 
         # 4-term Blackman-Harris window function
-        self.wF = [int((0.35875-0.48829*cos(k*2*pi/pts)+0.14128*cos(k*4*pi/pts)-0.01168*cos(k*6*pi/pts))*(2**(bitwidth-1))) for k in range(pts)]
+        self.wFr = [int((0.35875-0.48829*cos(k*2*pi/pts)+0.14128*cos(k*4*pi/pts)-0.01168*cos(k*6*pi/pts))*(2**(bitwidth-1))) for k in range(pts)]
+        self.wFi = [0 for k in range(pts)]
 
         assert pts == 2**self.stages, f"Points {pts} must be 2**stages {self.stages}"
 
@@ -53,7 +59,8 @@ class FixedPointFFT(Elaboratable):
         yr = Memory(width=bw, depth=self.pts, name="yr")
         yi = Memory(width=bw, depth=self.pts, name="yi")
 
-        wF = Memory(width=width+1, depth=self.pts, init=self.wF, name="wF")
+        wFr = Memory(width=width+1, depth=self.pts, init=self.wFr, name="wFr")
+        wFi = Memory(width=width+1, depth=self.pts, init=self.wFi, name="wFi")
         Wr = Memory(width=width+1, depth=self.pts, init=self.Wr, name="Wr")
         Wi = Memory(width=width+1, depth=self.pts, init=self.Wi, name="Wi")
         
@@ -66,7 +73,11 @@ class FixedPointFFT(Elaboratable):
         m.submodules.yi_rd = yi_rd = yi.read_port()
         m.submodules.yi_wr = yi_wr = yi.write_port()
 
-        m.submodules.wF_rd = wF_rd = wF.read_port()
+        m.submodules.wFr_rd = wFr_rd = wFr.read_port()
+        m.submodules.wFr_wr = wFr_wr = wFr.write_port()
+        m.submodules.wFi_rd = wFi_rd = wFi.read_port()
+        m.submodules.wFi_wr = wFi_wr = wFi.write_port()
+
         m.submodules.Wr_rd = Wr_rd = Wr.read_port()
         m.submodules.Wi_rd = Wi_rd = Wi.read_port()
 
@@ -76,14 +87,24 @@ class FixedPointFFT(Elaboratable):
         m.d.comb += revidx.eq(Cat([idx.bit_select(i,1) for i in reversed(range(N))]))
 
         # Window
-        wf = Signal(signed(width+1))
+        wfr = Signal(signed(width+1))
+        wfi = Signal(signed(width+1))
         i_cooked = Signal(signed(width))
         q_cooked = Signal(signed(width))
         m.d.comb += [
-            wF_rd.addr.eq(idx),
-            wf.eq(wF_rd.data),
-            i_cooked.eq((wf*self.in_i) >> (width-1)),
-            q_cooked.eq((wf*self.in_q) >> (width-1)),
+            wFr_rd.addr.eq(idx),
+            wfr.eq(wFr_rd.data),
+            wFi_rd.addr.eq(idx),
+            wfi.eq(wFi_rd.data),
+            i_cooked.eq((wfr*self.in_i - wfi*self.in_q) >> (width-1)),
+            q_cooked.eq((wfr*self.in_q + wfi*self.in_i) >> (width-1)),
+        ]
+
+        # Window write
+        wfidx = Signal(range(self.pts+1))
+        m.d.comb += [
+            wFr_wr.data.eq(self.wf_real),
+            wFi_wr.data.eq(self.wf_imag),
         ]
 
         # FFT
@@ -146,6 +167,31 @@ class FixedPointFFT(Elaboratable):
                         idx.eq(0),
                     ]
                     m.next = "WINDOW"
+                with m.Elif(self.wf_start):
+                    m.d.sync += [
+                        self.done.eq(0),
+                        wfidx.eq(0),
+                    ]
+                    m.next = "WINDOW_WRLOOP"
+
+            with m.State("WINDOW_WRLOOP"):
+                m.d.sync += wFr_wr.en.eq(0)
+                m.d.sync += wFi_wr.en.eq(0)
+                with m.If(wfidx >= pts):
+                    m.d.sync += wfidx.eq(0)
+                    m.next = "DONE"
+                with m.Else():
+                    m.d.sync += wfidx.eq(wfidx+1)
+                    m.next = "WINDOW_WR"
+
+            with m.State("WINDOW_WR"):
+                with m.If(self.wf_strobe):
+                    m.d.sync += [
+                        wFr_wr.addr.eq(wfidx),
+                        wFr_wr.en.eq(1),
+                        wFi_wr.en.eq(1),
+                    ]
+                    m.next = "WINDOW_WRLOOP"
 
             with m.State("WINDOW"):
                 m.d.sync += xr_wr.en.eq(0)
@@ -373,6 +419,37 @@ class FixedPointFFTTest(GatewareTestCase):
         I =[int(cos(2*16*pi*i/PTS) * (2**16-1)) for i in range(PTS)]
         Q =[int(sin(2*16*pi*i/PTS) * (2**16-1)) for i in range(PTS)]
 
+        # Rectangular
+        WR =[(2**17-1) for i in range(PTS)]
+        # Flat top 1-1.93*cos(2*pi*i/PTS)+1.29*cos(4*pi*i/PTS)-0.388*cos(6*pi*i/PTS)+0.032*cos(8*pi*i/PTS)
+        #WR =[int((1-1.93*cos(2*pi*i/PTS)+1.29*cos(4*pi*i/PTS)-0.388*cos(6*pi*i/PTS)+0.032*cos(8*pi*i/PTS))*(2**17-1)) for i in range(PTS)]
+        # Blackman Nuttall
+        #WR =[int((0.3635819-0.4891775*cos(k*2*pi/PTS)+0.1365995*cos(k*4*pi/PTS)-0.0106411*cos(k*6*pi/PTS))*(2**17-1)) for k in range(PTS)]
+        WI =[0 for i in range(PTS)]
+
+        yield
+        yield dut.wf_start.eq(1)
+        yield
+        yield dut.wf_start.eq(0)
+        yield
+        yield
+        yield
+
+        for i in range(PTS):
+            yield dut.wf_real.eq(WR[i])
+            yield dut.wf_imag.eq(WI[i])
+            yield
+            yield dut.wf_strobe.eq(1)
+            yield
+            yield dut.wf_strobe.eq(0)
+            yield
+            yield
+            yield
+
+        # Waiting done
+        for _ in range(16):
+            yield
+
         yield
         yield dut.start.eq(1)
         yield
@@ -410,5 +487,9 @@ if __name__ == "__main__":
         fft.strobe_out,
         fft.start,
         fft.done,
+        fft.wf_start,
+        fft.wf_real,
+        fft.wf_imag,
+        fft.wf_strobe,
     ]
     main(fft, name="FixedPointFFT", ports=ports)
